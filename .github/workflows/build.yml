@@ -1,0 +1,59 @@
+name: Build TaskWatch
+
+on:
+  release:
+    types: [created]
+
+jobs:
+
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '25'
+
+      - name: Build Windows App
+        run: jpackage --input . --main-jar TaskWatch.jar --main-class TaskWatch --name TaskWatch --type exe --dest dist
+
+      - name: Upload Windows Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TaskWatch-Windows
+          path: dist/*.exe
+
+
+  build-mac:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '25'
+
+      - name: Build Mac App
+        run: |
+          jpackage \
+            --input . \
+            --main-jar TaskWatch.jar \
+            --main-class TaskWatch \
+            --name TaskWatch \
+            --type dmg \
+            --dest dist
+
+      - name: Upload Mac Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TaskWatch-Mac
+          path: dist/*.dmg
