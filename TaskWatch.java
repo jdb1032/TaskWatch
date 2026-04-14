@@ -1,7 +1,7 @@
 import javax.swing.*;
 import javax.swing.table.*;
 import java.awt.*;
-// import java.awt.event.*;
+import java.awt.event.*;
 import java.util.ArrayList;
 
 public class TaskWatch extends JFrame {
@@ -28,7 +28,7 @@ public class TaskWatch extends JFrame {
     private JComboBox<String> ahtUnitBox;
     private JButton playBtn, lapBtn, resetBtn;
     private DefaultTableModel tableModel;
-    private JLabel totalLabel, avgLabel;
+    private JLabel totalLabel, avgLabel, paceLabel;
     private Timer swingTimer;
 
     // -------------------------------------------------------------------------
@@ -215,14 +215,16 @@ public class TaskWatch extends JFrame {
         scroll.getViewport().setBackground(Color.decode("#131313"));
         scroll.setBackground(Color.decode("#131313"));
 
-        // ---- Summary strip ----
-        JPanel sumPanel = new JPanel(new GridLayout(1, 2, 16, 0));
+        // ---- Summary strip (3 tiles: Total | Avg | Pace) ----
+        JPanel sumPanel = new JPanel(new GridLayout(1, 3, 10, 0));
         sumPanel.setBackground(Color.decode("#0f0f0f"));
         sumPanel.setBorder(BorderFactory.createEmptyBorder(14, 0, 0, 0));
-        totalLabel = summaryLabel("Total   -");
-        avgLabel   = summaryLabel("Avg   -");
+        totalLabel = summaryLabel("Total   —");
+        avgLabel   = summaryLabel("Avg   —");
+        paceLabel  = summaryLabel("Pace   —");
         sumPanel.add(totalLabel);
         sumPanel.add(avgLabel);
+        sumPanel.add(paceLabel);
 
         JPanel bottomPanel = new JPanel(new BorderLayout(0, 0));
         bottomPanel.setBackground(Color.decode("#0f0f0f"));
@@ -287,6 +289,7 @@ public class TaskWatch extends JFrame {
         avgLabel.setText("Avg   —");
         clearIntervalAlert();
         clearAvgAlert();
+        resetPaceLabel();
         styleButton(playBtn, "[ Play ]", "#1a8cff", "#0f0f0f");
         styleButton(lapBtn, "[ Lap ]", "#2a2a2a", "#888888");
         lapBtn.setEnabled(false);
@@ -302,6 +305,7 @@ public class TaskWatch extends JFrame {
         timeDisplay.setText(formatMs(now));
         splitDisplay.setText(formatMs(intervalMs));
         checkIntervalBreach(intervalMs);
+        updatePace();
     }
 
     /** AHT threshold in milliseconds; 0 if not configured. */
@@ -377,7 +381,7 @@ public class TaskWatch extends JFrame {
         } catch (NumberFormatException ex) {
             ahtValue = 0;
         }
-        // Re-evaluate both alerts immediately
+        // Re-evaluate all alerts immediately
         long intervalMs = elapsed() - lastLapTime;
         checkIntervalBreach(intervalMs);
         if (!laps.isEmpty()) {
@@ -387,6 +391,7 @@ public class TaskWatch extends JFrame {
         } else {
             if (avgBreached) clearAvgAlert();
         }
+        updatePace();
     }
 
     private void updateSummary() {
@@ -396,8 +401,79 @@ public class TaskWatch extends JFrame {
         totalLabel.setText("Total   " + formatMs(total));
         avgLabel.setText("Avg   " + formatMs(avg));
         checkAvgBreach(avg);
+        updatePace();
     }
 
+    // -------------------------------------------------------------------------
+    // Pace indicator
+    // -------------------------------------------------------------------------
+
+    /**
+     * Pace = (completedTasks × ahtLimitMs) − elapsed
+     *
+     * Positive → ahead of target (green)  e.g. "+8:00"
+     * Negative → behind target  (red)     e.g. "-5:30"
+     *
+     * Only meaningful when AHT is set and at least one task has been logged.
+     * Updated on every timer tick so it counts down in real-time.
+     */
+    private void updatePace() {
+        long limit = ahtLimitMs();
+        if (limit <= 0 || laps.isEmpty()) {
+            resetPaceLabel();
+            return;
+        }
+
+        long target = (long) laps.size() * limit;
+        long pace   = target - elapsed();    // + = ahead, - = behind
+        boolean ahead = pace >= 0;
+
+        String sign     = ahead ? "+" : "-";
+        String timeStr  = formatPace(Math.abs(pace));
+        paceLabel.setText("Pace  " + sign + timeStr);
+        paceLabel.setOpaque(true);
+
+        if (ahead) {
+            paceLabel.setForeground(Color.decode("#22cc66"));
+            paceLabel.setBackground(Color.decode("#0a1f12"));
+            paceLabel.setBorder(BorderFactory.createCompoundBorder(
+                    BorderFactory.createLineBorder(Color.decode("#1a6635"), 1),
+                    BorderFactory.createEmptyBorder(6, 0, 6, 0)));
+        } else {
+            paceLabel.setForeground(Color.decode("#ff5555"));
+            paceLabel.setBackground(Color.decode("#1f0a0a"));
+            paceLabel.setBorder(BorderFactory.createCompoundBorder(
+                    BorderFactory.createLineBorder(Color.decode("#661a1a"), 1),
+                    BorderFactory.createEmptyBorder(6, 0, 6, 0)));
+        }
+    }
+
+    /** Restore pace tile to neutral/empty state. */
+    private void resetPaceLabel() {
+        paceLabel.setText("Pace   —");
+        paceLabel.setForeground(Color.decode("#555555"));
+        paceLabel.setBackground(Color.decode("#111111"));
+        paceLabel.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(Color.decode("#1e1e1e"), 1),
+                BorderFactory.createEmptyBorder(6, 0, 6, 0)));
+    }
+
+    /**
+     * Format milliseconds as M:SS or H:MM:SS (no centiseconds — seconds
+     * precision is appropriate for a budget/pace metric).
+     */
+    private String formatPace(long ms) {
+        long totalSecs = ms / 1000;
+        long s = totalSecs % 60;
+        long m = (totalSecs / 60) % 60;
+        long h = totalSecs / 3600;
+        if (h > 0) return String.format("%d:%02d:%02d", h, m, s);
+        return String.format("%d:%02d", m, s);
+    }
+
+    // -------------------------------------------------------------------------
+    // Shared helpers
+    // -------------------------------------------------------------------------
     private long elapsed() {
         return running
                 ? elapsedAtPause + (System.currentTimeMillis() - startTime)
