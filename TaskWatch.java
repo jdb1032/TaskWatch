@@ -12,13 +12,16 @@ public class TaskWatch extends JFrame {
     private long lastLapTime = 0;
     private boolean running = false;
     private int lapNumber = 0;
-    private final ArrayList<long[]> laps = new ArrayList<>(); // [lapMs, splitMs]
+    private final ArrayList<long[]> laps = new ArrayList<>(); // [totalMs, splitMs]
 
     // AHT state
-    private int ahtValue = 0;          // raw number user typed
+    private int ahtValue = 0;           // raw number user typed
     private boolean ahtInSeconds = false; // false = minutes, true = seconds
     private boolean intervalBreached = false;
     private boolean avgBreached = false;
+
+    // Preference: suppress banner when running average is still under AHT
+    private boolean softAlertsWhenOnPace = false;
 
     // --- UI ---
     private JLabel timeDisplay;
@@ -43,9 +46,23 @@ public class TaskWatch extends JFrame {
     // -------------------------------------------------------------------------
     public TaskWatch() {
         setTitle("Task Watch");
-        setDefaultCloseOperation(EXIT_ON_CLOSE);
+        // DISPOSE_ON_CLOSE so closing one window doesn't kill sibling windows.
+        // The WindowAdapter below exits the JVM only when the last window closes.
+        setDefaultCloseOperation(DISPOSE_ON_CLOSE);
+        addWindowListener(new WindowAdapter() {
+            @Override
+            public void windowClosed(WindowEvent e) {
+                for (Window w : Window.getWindows()) {
+                    if (w instanceof TaskWatch && w.isDisplayable()) return;
+                }
+                System.exit(0);
+            }
+        });
         setResizable(false);
         setBackground(Color.decode("#0f0f0f"));
+
+        // ---- Menu bar ----
+        setJMenuBar(buildMenuBar());
 
         JPanel root = new JPanel(new BorderLayout(0, 0));
         root.setBackground(Color.decode("#0f0f0f"));
@@ -73,7 +90,7 @@ public class TaskWatch extends JFrame {
         intervalTag.setAlignmentX(Component.CENTER_ALIGNMENT);
         intervalTag.setBorder(BorderFactory.createEmptyBorder(6, 0, 0, 0));
 
-        splitDisplay = new JLabel("00:00:00.00", SwingConstants.CENTER);
+        splitDisplay = new JLabel("00:00:00", SwingConstants.CENTER);
         splitDisplay.setFont(loadMono(30f));
         splitDisplay.setForeground(Color.decode("#1a8cff"));
         splitDisplay.setAlignmentX(Component.CENTER_ALIGNMENT);
@@ -184,7 +201,7 @@ public class TaskWatch extends JFrame {
         table.getTableHeader().setForeground(Color.decode("#666666"));
         table.getTableHeader().setBorder(BorderFactory.createMatteBorder(0, 0, 1, 0, Color.decode("#2a2a2a")));
 
-        int[] widths = {36, 110, 110, 110};
+        int[] widths = {36, 110, 110, 100};
         for (int i = 0; i < widths.length; i++) {
             table.getColumnModel().getColumn(i).setPreferredWidth(widths[i]);
         }
@@ -215,8 +232,8 @@ public class TaskWatch extends JFrame {
         scroll.getViewport().setBackground(Color.decode("#131313"));
         scroll.setBackground(Color.decode("#131313"));
 
-        // ---- Summary strip (3 tiles: Total | Avg | Pace) ----
-        JPanel sumPanel = new JPanel(new GridLayout(1, 3, 10, 0));
+        // ---- Summary strip ----
+        JPanel sumPanel = new JPanel(new GridLayout(1, 3, 16, 0));
         sumPanel.setBackground(Color.decode("#0f0f0f"));
         sumPanel.setBorder(BorderFactory.createEmptyBorder(14, 0, 0, 0));
         totalLabel = summaryLabel("Total   —");
@@ -237,6 +254,71 @@ public class TaskWatch extends JFrame {
         setLocationRelativeTo(null);
 
         swingTimer = new Timer(10, e -> updateDisplay());
+    }
+
+    // -------------------------------------------------------------------------
+    // Menu bar
+    // -------------------------------------------------------------------------
+    private JMenuBar buildMenuBar() {
+        JMenuBar bar = new JMenuBar();
+        bar.setBackground(Color.decode("#161616"));
+        bar.setBorder(BorderFactory.createMatteBorder(0, 0, 1, 0, Color.decode("#2a2a2a")));
+
+        // ---- File ----
+        JMenu fileMenu = styledMenu("File");
+
+        JMenuItem newItem = styledMenuItem("New");
+        newItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_N, InputEvent.CTRL_DOWN_MASK));
+        newItem.addActionListener(e ->
+            SwingUtilities.invokeLater(() -> new TaskWatch().setVisible(true))
+        );
+
+        JMenuItem exitItem = styledMenuItem("Exit");
+        exitItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_W, InputEvent.CTRL_DOWN_MASK));
+        exitItem.addActionListener(e -> dispose());
+
+        fileMenu.add(newItem);
+        fileMenu.addSeparator();
+        fileMenu.add(exitItem);
+
+        // ---- Preferences ----
+        JMenu prefMenu = styledMenu("Preferences");
+
+        JCheckBoxMenuItem softAlertsItem = new JCheckBoxMenuItem("Soft Alerts When On Pace");
+        softAlertsItem.setFont(loadMono(13f));
+        softAlertsItem.setBackground(Color.decode("#1e1e1e"));
+        softAlertsItem.setForeground(Color.decode("#cccccc"));
+        softAlertsItem.setToolTipText(
+            "When your running average is still under AHT, suppress the banner "
+            + "and use a muted colour instead of the full red alert.");
+        softAlertsItem.addActionListener(e -> {
+            softAlertsWhenOnPace = softAlertsItem.isSelected();
+            // Re-evaluate the live interval immediately
+            long intervalMs = elapsed() - lastLapTime;
+            if (intervalBreached) refreshIntervalVisuals(intervalMs);
+        });
+
+        prefMenu.add(softAlertsItem);
+
+        bar.add(fileMenu);
+        bar.add(prefMenu);
+        return bar;
+    }
+
+    private JMenu styledMenu(String text) {
+        JMenu m = new JMenu(text);
+        m.setFont(loadMono(13f));
+        m.setForeground(Color.decode("#cccccc"));
+        m.setBackground(Color.decode("#1e1e1e"));
+        return m;
+    }
+
+    private JMenuItem styledMenuItem(String text) {
+        JMenuItem i = new JMenuItem(text);
+        i.setFont(loadMono(13f));
+        i.setBackground(Color.decode("#1e1e1e"));
+        i.setForeground(Color.decode("#cccccc"));
+        return i;
     }
 
     // -------------------------------------------------------------------------
@@ -268,9 +350,10 @@ public class TaskWatch extends JFrame {
         lapNumber++;
         laps.add(new long[]{now, splitMs});
 
+        // From/To use the precise centisecond clock; Handle Time uses HH:MM:SS
         String fromStr  = lapNumber == 1 ? "00:00:00.00" : formatMs(laps.get(lapNumber - 2)[0]);
         String toStr    = formatMs(now);
-        String splitStr = formatMs(splitMs);
+        String splitStr = formatHMS(splitMs);
         tableModel.insertRow(0, new Object[]{lapNumber, fromStr, toStr, splitStr});
 
         clearIntervalAlert();
@@ -284,14 +367,14 @@ public class TaskWatch extends JFrame {
         laps.clear();
         tableModel.setRowCount(0);
         timeDisplay.setText("00:00:00.00");
-        splitDisplay.setText("00:00:00.00");
+        splitDisplay.setText("00:00:00");
         totalLabel.setText("Total   —");
         avgLabel.setText("Avg   —");
+        resetPaceLabel();
         clearIntervalAlert();
         clearAvgAlert();
-        resetPaceLabel();
         styleButton(playBtn, "[ Play ]", "#1a8cff", "#0f0f0f");
-        styleButton(lapBtn, "[ Lap ]", "#2a2a2a", "#888888");
+        styleButton(lapBtn, "[ Log ]", "#2a2a2a", "#888888");
         lapBtn.setEnabled(false);
         resetBtn.setEnabled(false);
     }
@@ -303,7 +386,7 @@ public class TaskWatch extends JFrame {
         long now = elapsed();
         long intervalMs = now - lastLapTime;
         timeDisplay.setText(formatMs(now));
-        splitDisplay.setText(formatMs(intervalMs));
+        splitDisplay.setText(formatHMS(intervalMs));
         checkIntervalBreach(intervalMs);
         updatePace();
     }
@@ -316,106 +399,29 @@ public class TaskWatch extends JFrame {
                 : (long) ahtValue * 60 * 1000;
     }
 
-    private void checkIntervalBreach(long intervalMs) {
+    /**
+     * Returns true when elapsed is still inside the cumulative AHT budget
+     * for the laps completed so far — identical logic to updatePace().
+     */
+    private boolean isOnPace() {
         long limit = ahtLimitMs();
-        if (limit <= 0) {
-            if (intervalBreached) clearIntervalAlert();
-            return;
-        }
-        boolean over = intervalMs >= limit;
-        if (over && !intervalBreached) {
-            intervalBreached = true;
-            ahtAlertBanner.setVisible(true);
-            splitDisplay.setForeground(Color.decode("#ff2222"));
-            // Main clock stays white — only avg breach changes it
-            pack();
-        } else if (!over && intervalBreached) {
-            clearIntervalAlert();
-        }
-    }
-
-    private void checkAvgBreach(long avgMs) {
-        long limit = ahtLimitMs();
-        if (limit <= 0) {
-            if (avgBreached) clearAvgAlert();
-            return;
-        }
-        boolean over = avgMs > limit;
-        if (over && !avgBreached) {
-            avgBreached = true;
-            avgLabel.setBackground(Color.decode("#2a0000"));
-            avgLabel.setForeground(Color.decode("#ff4444"));
-            avgLabel.setBorder(BorderFactory.createCompoundBorder(
-                    BorderFactory.createLineBorder(Color.decode("#cc0000"), 2),
-                    BorderFactory.createEmptyBorder(5, 0, 5, 0)));
-            // Only here does the main clock turn red
-            timeDisplay.setForeground(Color.decode("#ff6666"));
-        } else if (!over && avgBreached) {
-            clearAvgAlert();
-        }
-    }
-
-    private void clearIntervalAlert() {
-        intervalBreached = false;
-        ahtAlertBanner.setVisible(false);
-        splitDisplay.setForeground(Color.decode("#1a8cff"));
-        // Do NOT touch main clock color here — that belongs to avg alert
-        pack();
-    }
-
-    private void clearAvgAlert() {
-        avgBreached = false;
-        avgLabel.setBackground(Color.decode("#111111"));
-        avgLabel.setForeground(Color.decode("#555555"));
-        avgLabel.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createLineBorder(Color.decode("#1e1e1e"), 1),
-                BorderFactory.createEmptyBorder(6, 0, 6, 0)));
-        timeDisplay.setForeground(Color.decode("#e8e8e8")); // restore main clock to white
-    }
-
-    private void parseAht() {
-        String txt = ahtField.getText().trim();
-        try {
-            int val = Integer.parseInt(txt);
-            ahtValue = val > 0 ? val : 0;
-        } catch (NumberFormatException ex) {
-            ahtValue = 0;
-        }
-        // Re-evaluate all alerts immediately
-        long intervalMs = elapsed() - lastLapTime;
-        checkIntervalBreach(intervalMs);
-        if (!laps.isEmpty()) {
-            long total = 0;
-            for (long[] lap : laps) total += lap[1];
-            checkAvgBreach(total / laps.size());
-        } else {
-            if (avgBreached) clearAvgAlert();
-        }
-        updatePace();
-    }
-
-    private void updateSummary() {
-        long total = 0;
-        for (long[] lap : laps) total += lap[1];
-        long avg = laps.isEmpty() ? 0 : total / laps.size();
-        totalLabel.setText("Total   " + formatMs(total));
-        avgLabel.setText("Avg   " + formatMs(avg));
-        checkAvgBreach(avg);
-        updatePace();
+        if (limit <= 0) return false;
+        if (laps.isEmpty()) return true;
+        long target = (long) laps.size() * limit;
+        return (target - elapsed()) >= 0;
     }
 
     // -------------------------------------------------------------------------
-    // Pace indicator
+    // Pace indicator (live — driven by updateDisplay every 10 ms)
     // -------------------------------------------------------------------------
 
     /**
      * Pace = (completedTasks × ahtLimitMs) − elapsed
      *
-     * Positive → ahead of target (green)  e.g. "+8:00"
-     * Negative → behind target  (red)     e.g. "-5:30"
+     * Positive → ahead of budget (green)  e.g. "+8:00"
+     * Negative → behind budget  (red)     e.g. "-5:30"
      *
-     * Only meaningful when AHT is set and at least one task has been logged.
-     * Updated on every timer tick so it counts down in real-time.
+     * Requires AHT to be set and at least one lap logged.
      */
     private void updatePace() {
         long limit = ahtLimitMs();
@@ -424,12 +430,12 @@ public class TaskWatch extends JFrame {
             return;
         }
 
-        long target = (long) laps.size() * limit;
-        long pace   = target - elapsed();    // + = ahead, - = behind
+        long target  = (long) laps.size() * limit;
+        long pace    = target - elapsed();   // + = ahead, - = behind
         boolean ahead = pace >= 0;
 
-        String sign     = ahead ? "+" : "-";
-        String timeStr  = formatPace(Math.abs(pace));
+        String sign    = ahead ? "+" : "-";
+        String timeStr = formatPace(Math.abs(pace));
         paceLabel.setText("Pace  " + sign + timeStr);
         paceLabel.setOpaque(true);
 
@@ -459,8 +465,8 @@ public class TaskWatch extends JFrame {
     }
 
     /**
-     * Format milliseconds as M:SS or H:MM:SS (no centiseconds — seconds
-     * precision is appropriate for a budget/pace metric).
+     * Format milliseconds as M:SS or H:MM:SS (seconds precision is
+     * appropriate for a budget/pace metric — no centiseconds needed).
      */
     private String formatPace(long ms) {
         long totalSecs = ms / 1000;
@@ -471,15 +477,121 @@ public class TaskWatch extends JFrame {
         return String.format("%d:%02d", m, s);
     }
 
-    // -------------------------------------------------------------------------
-    // Shared helpers
-    // -------------------------------------------------------------------------
+
+    private void checkIntervalBreach(long intervalMs) {
+        long limit = ahtLimitMs();
+        if (limit <= 0) {
+            if (intervalBreached) clearIntervalAlert();
+            return;
+        }
+        boolean over = intervalMs >= limit;
+        if (over) {
+            boolean wasBreached = intervalBreached;
+            intervalBreached = true;
+            refreshIntervalVisuals(intervalMs);
+            if (!wasBreached) pack(); // resize only on first breach (banner may appear)
+        } else if (intervalBreached) {
+            clearIntervalAlert();
+        }
+    }
+
+    /**
+     * Applies the correct visual state for an active interval breach,
+     * respecting the "Soft Alerts When On Pace" preference.
+     * Call whenever breach is active and something that affects the decision changes
+     * (timer tick, preference toggle, AHT value change).
+     */
+    private void refreshIntervalVisuals(long intervalMs) {
+        boolean quiet = softAlertsWhenOnPace && isOnPace();
+        boolean bannerShouldShow = !quiet;
+
+        if (ahtAlertBanner.isVisible() != bannerShouldShow) {
+            ahtAlertBanner.setVisible(bannerShouldShow);
+            pack();
+        }
+        // Full alarm red vs. muted coral
+        splitDisplay.setForeground(Color.decode(quiet ? "#ff9999" : "#ff2222"));
+    }
+
+    private void checkAvgBreach(long avgMs) {
+        long limit = ahtLimitMs();
+        if (limit <= 0) {
+            if (avgBreached) clearAvgAlert();
+            return;
+        }
+        boolean over = avgMs > limit;
+        if (over && !avgBreached) {
+            avgBreached = true;
+            avgLabel.setBackground(Color.decode("#2a0000"));
+            avgLabel.setForeground(Color.decode("#ff4444"));
+            avgLabel.setBorder(BorderFactory.createCompoundBorder(
+                    BorderFactory.createLineBorder(Color.decode("#cc0000"), 2),
+                    BorderFactory.createEmptyBorder(5, 0, 5, 0)));
+            // Only avg breach turns the main clock red
+            timeDisplay.setForeground(Color.decode("#ff6666"));
+            // Average is now over — if a task breach is active, force full alert
+            if (intervalBreached) refreshIntervalVisuals(elapsed() - lastLapTime);
+        } else if (!over && avgBreached) {
+            clearAvgAlert();
+        }
+    }
+
+    private void clearIntervalAlert() {
+        intervalBreached = false;
+        ahtAlertBanner.setVisible(false);
+        splitDisplay.setForeground(Color.decode("#1a8cff"));
+        // Do NOT touch main clock colour — that belongs to the avg alert
+        pack();
+    }
+
+    private void clearAvgAlert() {
+        avgBreached = false;
+        avgLabel.setBackground(Color.decode("#111111"));
+        avgLabel.setForeground(Color.decode("#555555"));
+        avgLabel.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(Color.decode("#1e1e1e"), 1),
+                BorderFactory.createEmptyBorder(6, 0, 6, 0)));
+        timeDisplay.setForeground(Color.decode("#e8e8e8")); // restore main clock to white
+    }
+
+    private void parseAht() {
+        String txt = ahtField.getText().trim();
+        try {
+            int val = Integer.parseInt(txt);
+            ahtValue = val > 0 ? val : 0;
+        } catch (NumberFormatException ex) {
+            ahtValue = 0;
+        }
+        // Re-evaluate both alerts immediately
+        long intervalMs = elapsed() - lastLapTime;
+        checkIntervalBreach(intervalMs);
+        if (!laps.isEmpty()) {
+            long total = 0;
+            for (long[] lap : laps) total += lap[1];
+            checkAvgBreach(total / laps.size());
+        } else {
+            if (avgBreached) clearAvgAlert();
+        }
+        updatePace();
+    }
+
+    private void updateSummary() {
+        long total = 0;
+        for (long[] lap : laps) total += lap[1];
+        long avg = laps.isEmpty() ? 0 : total / laps.size();
+        totalLabel.setText("Total   " + formatHMS(total));
+        avgLabel.setText("Avg   " + formatHMS(avg));
+        checkAvgBreach(avg);
+        updatePace();
+    }
+
     private long elapsed() {
         return running
                 ? elapsedAtPause + (System.currentTimeMillis() - startTime)
                 : elapsedAtPause;
     }
 
+    /** Full precision: HH:MM:SS.cs — used for the live clocks and From/To columns. */
     private String formatMs(long ms) {
         long centis = ms / 10;
         long cs = centis % 100;
@@ -487,6 +599,15 @@ public class TaskWatch extends JFrame {
         long m  = (centis / 6000) % 60;
         long h  = centis / 360000;
         return String.format("%02d:%02d:%02d.%02d", h, m, s, cs);
+    }
+
+    /** Compact: HH:MM:SS — used for the Handle Time column in the lap table. */
+    private String formatHMS(long ms) {
+        long totalSec = ms / 1000;
+        long s = totalSec % 60;
+        long m = (totalSec / 60) % 60;
+        long h = totalSec / 3600;
+        return String.format("%02d:%02d:%02d", h, m, s);
     }
 
     // -------------------------------------------------------------------------
