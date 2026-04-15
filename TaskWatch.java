@@ -2,7 +2,11 @@ import javax.swing.*;
 import javax.swing.table.*;
 import java.awt.*;
 import java.awt.event.*;
+import java.io.*;
+import java.nio.file.*;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 
 public class TaskWatch extends JFrame {
 
@@ -23,6 +27,10 @@ public class TaskWatch extends JFrame {
     // Preference: suppress banner when running average is still under AHT
     private boolean softAlertsWhenOnPace = false;
 
+    // Save state
+    private boolean autoSaveEnabled = true;  // Preferences toggle, on by default
+    private boolean sessionSaved = false;    // prevents shutdown-hook double-save
+
     // --- UI ---
     private JLabel timeDisplay;
     private JLabel splitDisplay;
@@ -33,6 +41,7 @@ public class TaskWatch extends JFrame {
     private DefaultTableModel tableModel;
     private JLabel totalLabel, avgLabel, paceLabel;
     private Timer swingTimer;
+    private Timer periodicSaveTimer;
 
     // -------------------------------------------------------------------------
     // Entry point
@@ -47,17 +56,20 @@ public class TaskWatch extends JFrame {
     public TaskWatch() {
         setTitle("Task Watch");
         // DISPOSE_ON_CLOSE so closing one window doesn't kill sibling windows.
-        // The WindowAdapter below exits the JVM only when the last window closes.
-        setDefaultCloseOperation(DISPOSE_ON_CLOSE);
+        // The WindowAdapter below handles the save-on-close prompt and exits
+        // the JVM only when the last window closes.
+        setDefaultCloseOperation(DO_NOTHING_ON_CLOSE);
         addWindowListener(new WindowAdapter() {
-            @Override
-            public void windowClosed(WindowEvent e) {
-                for (Window w : Window.getWindows()) {
-                    if (w instanceof TaskWatch && w.isDisplayable()) return;
-                }
-                System.exit(0);
-            }
+            @Override public void windowClosing(WindowEvent e) { handleClose(); }
         });
+
+        // Shutdown hook — catches crashes / force-closes when auto-save is on
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            if (autoSaveEnabled && !laps.isEmpty() && !sessionSaved) {
+                saveReport(true); // silent, off-EDT — file I/O only
+            }
+        }));
+
         setResizable(false);
         setBackground(Color.decode("#0f0f0f"));
 
@@ -253,7 +265,21 @@ public class TaskWatch extends JFrame {
         pack();
         setLocationRelativeTo(null);
 
+        // Register Ctrl+S globally
+        getRootPane().getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW)
+                .put(KeyStroke.getKeyStroke(KeyEvent.VK_S, InputEvent.CTRL_DOWN_MASK), "saveSession");
+        getRootPane().getActionMap().put("saveSession", new AbstractAction() {
+            public void actionPerformed(ActionEvent e) { saveReport(false); }
+        });
+
         swingTimer = new Timer(10, e -> updateDisplay());
+
+        // Periodic auto-save every 5 minutes — silent backup while the app runs
+        periodicSaveTimer = new Timer(5 * 60 * 1000, e -> {
+            if (autoSaveEnabled && !laps.isEmpty()) saveReport(true);
+        });
+        periodicSaveTimer.setRepeats(true);
+        periodicSaveTimer.start();
     }
 
     // -------------------------------------------------------------------------
@@ -273,11 +299,17 @@ public class TaskWatch extends JFrame {
             SwingUtilities.invokeLater(() -> new TaskWatch().setVisible(true))
         );
 
+        JMenuItem saveItem = styledMenuItem("Save Session");
+        saveItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_S, InputEvent.CTRL_DOWN_MASK));
+        saveItem.addActionListener(e -> saveReport(false));
+
         JMenuItem exitItem = styledMenuItem("Exit");
         exitItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_W, InputEvent.CTRL_DOWN_MASK));
-        exitItem.addActionListener(e -> dispose());
+        exitItem.addActionListener(e -> handleClose());
 
         fileMenu.add(newItem);
+        fileMenu.addSeparator();
+        fileMenu.add(saveItem);
         fileMenu.addSeparator();
         fileMenu.add(exitItem);
 
@@ -293,12 +325,22 @@ public class TaskWatch extends JFrame {
             + "and use a muted colour instead of the full red alert.");
         softAlertsItem.addActionListener(e -> {
             softAlertsWhenOnPace = softAlertsItem.isSelected();
-            // Re-evaluate the live interval immediately
             long intervalMs = elapsed() - lastLapTime;
             if (intervalBreached) refreshIntervalVisuals(intervalMs);
         });
 
+        JCheckBoxMenuItem autoSaveItem = new JCheckBoxMenuItem("Auto-save backup (every 5 min + on close)", true);
+        autoSaveItem.setFont(loadMono(13f));
+        autoSaveItem.setBackground(Color.decode("#1e1e1e"));
+        autoSaveItem.setForeground(Color.decode("#cccccc"));
+        autoSaveItem.setToolTipText(
+            "Automatically saves a session report every 5 minutes and triggers "
+            + "a save prompt on close. Files go to the 'Saved Tasks' folder next to the program.");
+        autoSaveItem.addActionListener(e -> autoSaveEnabled = autoSaveItem.isSelected());
+
         prefMenu.add(softAlertsItem);
+        prefMenu.addSeparator();
+        prefMenu.add(autoSaveItem);
 
         bar.add(fileMenu);
         bar.add(prefMenu);
@@ -319,6 +361,136 @@ public class TaskWatch extends JFrame {
         i.setBackground(Color.decode("#1e1e1e"));
         i.setForeground(Color.decode("#cccccc"));
         return i;
+    }
+
+    // -------------------------------------------------------------------------
+    // Close handling
+    // -------------------------------------------------------------------------
+    private void handleClose() {
+        if (laps.isEmpty()) {
+            doClose();
+            return;
+        }
+
+        Object[] options = {"Save & Exit", "Exit Without Saving", "Cancel"};
+        int choice = JOptionPane.showOptionDialog(
+                this,
+                "You have " + lapNumber + " logged task(s).\nWould you like to save a session report before closing?",
+                "Save Session",
+                JOptionPane.YES_NO_CANCEL_OPTION,
+                JOptionPane.QUESTION_MESSAGE,
+                null,
+                options,
+                options[0]
+        );
+
+        if (choice == 0) {        // Save & Exit
+            saveReport(false);
+            sessionSaved = true;
+            doClose();
+        } else if (choice == 1) { // Exit Without Saving
+            sessionSaved = true;  // suppress shutdown hook too
+            doClose();
+        }
+        // choice == 2 or dialog dismissed → Cancel: stay open
+    }
+
+    /** Disposes this window; exits the JVM when the last TaskWatch window closes. */
+    private void doClose() {
+        dispose();
+        for (Window w : Window.getWindows()) {
+            if (w instanceof TaskWatch && w.isDisplayable()) return;
+        }
+        System.exit(0);
+    }
+
+    // -------------------------------------------------------------------------
+    // Save logic
+    // -------------------------------------------------------------------------
+    /**
+     * Writes a session report to the "Saved Tasks" folder next to the program.
+     *
+     * @param silent  true = no dialogs (auto-save and shutdown hook)
+     */
+    private void saveReport(boolean silent) {
+        if (laps.isEmpty()) {
+            if (!silent) JOptionPane.showMessageDialog(this,
+                    "No tasks have been logged yet.", "Nothing to Save",
+                    JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+
+        // ---- Compute summary values ----
+        long total = 0;
+        for (long[] lap : laps) total += lap[1];
+        long avg = total / laps.size();
+
+        // Pace: mirror the same formula used by updatePace() / formatPace()
+        String paceStr = "—";
+        long limit = ahtLimitMs();
+        if (limit > 0) {
+            long target   = (long) laps.size() * limit;
+            long paceMs   = target - elapsed();
+            boolean ahead = paceMs >= 0;
+            paceStr = (ahead ? "+" : "-") + formatPace(Math.abs(paceMs));
+        }
+
+        String timestamp   = new SimpleDateFormat("yyyy-MM-dd_HH-mm-ss").format(new Date());
+        String displayTime = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date());
+        String filename    = "TaskWatch_" + timestamp + ".txt";
+
+        // ---- Resolve save directory: <working dir>/Saved Tasks/ ----
+        Path saveDir = Paths.get(System.getProperty("user.dir"), "Saved Tasks");
+        try {
+            Files.createDirectories(saveDir);
+            Path outFile = saveDir.resolve(filename);
+
+            // ---- Build report ----
+            StringBuilder sb = new StringBuilder();
+            sb.append("========================================\n");
+            sb.append("        TaskWatch — Session Report      \n");
+            sb.append("========================================\n");
+            sb.append("Saved         : ").append(displayTime).append("\n");
+            sb.append("\n");
+            sb.append("Tasks Logged  : ").append(lapNumber).append("\n");
+            sb.append("Total Time    : ").append(formatHMS(total)).append("\n");
+            sb.append("Average AHT   : ").append(formatHMS(avg)).append("\n");
+            sb.append("Pace          : ").append(paceStr).append("\n");
+            if (ahtValue > 0) {
+                sb.append("AHT Target    : ").append(ahtValue)
+                  .append(ahtInSeconds ? " sec" : " min").append("\n");
+            }
+            sb.append("\n");
+            sb.append("--- Task Log ---\n");
+            sb.append(String.format("%-6s  %-13s  %-13s  %-13s%n",
+                    "#", "From", "To", "Handle Time"));
+            sb.append("------  -------------  -------------  -------------\n");
+
+            for (int i = 0; i < laps.size(); i++) {
+                long[] lap   = laps.get(i);
+                String from  = (i == 0) ? "00:00:00.00" : formatMs(laps.get(i - 1)[0]);
+                String to    = formatMs(lap[0]);
+                String split = formatHMS(lap[1]);
+                sb.append(String.format("%-6d  %-13s  %-13s  %-13s%n", i + 1, from, to, split));
+            }
+
+            sb.append("========================================\n");
+
+            Files.writeString(outFile, sb.toString());
+
+            if (!silent) {
+                JOptionPane.showMessageDialog(this,
+                        "Session saved to:\n" + outFile.toAbsolutePath(),
+                        "Saved", JOptionPane.INFORMATION_MESSAGE);
+            }
+
+        } catch (IOException ex) {
+            if (!silent) {
+                JOptionPane.showMessageDialog(this,
+                        "Could not save session:\n" + ex.getMessage(),
+                        "Save Error", JOptionPane.ERROR_MESSAGE);
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -350,7 +522,7 @@ public class TaskWatch extends JFrame {
         lapNumber++;
         laps.add(new long[]{now, splitMs});
 
-        // From/To use the precise centisecond clock; Handle Time uses HH:MM:SS
+        // From/To use full centisecond precision; Handle Time column uses HH:MM:SS
         String fromStr  = lapNumber == 1 ? "00:00:00.00" : formatMs(laps.get(lapNumber - 2)[0]);
         String toStr    = formatMs(now);
         String splitStr = formatHMS(splitMs);
@@ -414,7 +586,6 @@ public class TaskWatch extends JFrame {
     // -------------------------------------------------------------------------
     // Pace indicator (live — driven by updateDisplay every 10 ms)
     // -------------------------------------------------------------------------
-
     /**
      * Pace = (completedTasks × ahtLimitMs) − elapsed
      *
@@ -476,7 +647,6 @@ public class TaskWatch extends JFrame {
         if (h > 0) return String.format("%d:%02d:%02d", h, m, s);
         return String.format("%d:%02d", m, s);
     }
-
 
     private void checkIntervalBreach(long intervalMs) {
         long limit = ahtLimitMs();
@@ -601,7 +771,7 @@ public class TaskWatch extends JFrame {
         return String.format("%02d:%02d:%02d.%02d", h, m, s, cs);
     }
 
-    /** Compact: HH:MM:SS — used for the Handle Time column in the lap table. */
+    /** Compact: HH:MM:SS — used for the Handle Time column and summary totals. */
     private String formatHMS(long ms) {
         long totalSec = ms / 1000;
         long s = totalSec % 60;
