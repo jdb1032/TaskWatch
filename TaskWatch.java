@@ -7,6 +7,7 @@ import java.nio.file.*;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.List;
 
 public class TaskWatch extends JFrame {
 
@@ -41,7 +42,6 @@ public class TaskWatch extends JFrame {
     private DefaultTableModel tableModel;
     private JLabel totalLabel, avgLabel, paceLabel;
     private Timer swingTimer;
-    private Timer periodicSaveTimer;
 
     // -------------------------------------------------------------------------
     // Entry point
@@ -273,13 +273,6 @@ public class TaskWatch extends JFrame {
         });
 
         swingTimer = new Timer(10, e -> updateDisplay());
-
-        // Periodic auto-save every 5 minutes — silent backup while the app runs
-        periodicSaveTimer = new Timer(5 * 60 * 1000, e -> {
-            if (autoSaveEnabled && !laps.isEmpty()) saveReport(true);
-        });
-        periodicSaveTimer.setRepeats(true);
-        periodicSaveTimer.start();
     }
 
     // -------------------------------------------------------------------------
@@ -299,6 +292,10 @@ public class TaskWatch extends JFrame {
             SwingUtilities.invokeLater(() -> new TaskWatch().setVisible(true))
         );
 
+        JMenuItem loadItem = styledMenuItem("Load Saved Task");
+        loadItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_O, InputEvent.CTRL_DOWN_MASK));
+        loadItem.addActionListener(e -> onLoadSavedTask());
+
         JMenuItem saveItem = styledMenuItem("Save Session");
         saveItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_S, InputEvent.CTRL_DOWN_MASK));
         saveItem.addActionListener(e -> saveReport(false));
@@ -308,6 +305,7 @@ public class TaskWatch extends JFrame {
         exitItem.addActionListener(e -> handleClose());
 
         fileMenu.add(newItem);
+        fileMenu.add(loadItem);
         fileMenu.addSeparator();
         fileMenu.add(saveItem);
         fileMenu.addSeparator();
@@ -329,13 +327,13 @@ public class TaskWatch extends JFrame {
             if (intervalBreached) refreshIntervalVisuals(intervalMs);
         });
 
-        JCheckBoxMenuItem autoSaveItem = new JCheckBoxMenuItem("Auto-save backup (every 5 min + on close)", true);
+        JCheckBoxMenuItem autoSaveItem = new JCheckBoxMenuItem("Auto-save backup on close", true);
         autoSaveItem.setFont(loadMono(13f));
         autoSaveItem.setBackground(Color.decode("#1e1e1e"));
         autoSaveItem.setForeground(Color.decode("#cccccc"));
         autoSaveItem.setToolTipText(
-            "Automatically saves a session report every 5 minutes and triggers "
-            + "a save prompt on close. Files go to the 'Saved Tasks' folder next to the program.");
+            "Automatically triggers a save prompt on close. "
+            + "Files go to the 'Saved Tasks' folder next to the program.");
         autoSaveItem.addActionListener(e -> autoSaveEnabled = autoSaveItem.isSelected());
 
         prefMenu.add(softAlertsItem);
@@ -361,6 +359,217 @@ public class TaskWatch extends JFrame {
         i.setBackground(Color.decode("#1e1e1e"));
         i.setForeground(Color.decode("#cccccc"));
         return i;
+    }
+
+    // -------------------------------------------------------------------------
+    // Load Saved Task
+    // -------------------------------------------------------------------------
+
+    /**
+     * Entry point for loading a saved task. If the current session has data,
+     * asks the user whether to open a new window, reset this one, or cancel.
+     */
+    private void onLoadSavedTask() {
+        if (!laps.isEmpty() || elapsedAtPause > 0) {
+            Object[] options = {"Open in New Window", "Reset & Load Here", "Cancel"};
+            int choice = JOptionPane.showOptionDialog(
+                    this,
+                    "The current session has data.\nHow would you like to load the saved task?",
+                    "Load Saved Task",
+                    JOptionPane.YES_NO_CANCEL_OPTION,
+                    JOptionPane.WARNING_MESSAGE,
+                    null,
+                    options,
+                    options[0]
+            );
+
+            if (choice == 0) {
+                // Open a new instance and trigger the file dialog there
+                SwingUtilities.invokeLater(() -> {
+                    TaskWatch tw = new TaskWatch();
+                    tw.setVisible(true);
+                    tw.openLoadDialog();
+                });
+                return;
+            } else if (choice == 1) {
+                // Reset this instance first, then load
+                onReset();
+            } else {
+                // Cancel (choice == 2 or dialog dismissed)
+                return;
+            }
+        }
+        openLoadDialog();
+    }
+
+    /**
+     * Opens a file chooser pointed at the "Saved Tasks" folder (if it exists)
+     * and hands the chosen file off to loadFromFile().
+     */
+    private void openLoadDialog() {
+        JFileChooser fc = new JFileChooser();
+        fc.setDialogTitle("Load Saved Task");
+        fc.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter(
+                "TaskWatch Session Files (*.txt)", "txt"));
+
+        // Default to the Saved Tasks folder if it exists
+        Path savedTasksDir = Paths.get(System.getProperty("user.dir"), "Saved Tasks");
+        if (Files.exists(savedTasksDir)) {
+            fc.setCurrentDirectory(savedTasksDir.toFile());
+        }
+
+        if (fc.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) return;
+        loadFromFile(fc.getSelectedFile());
+    }
+
+    /**
+     * Parses a TaskWatch session report file and restores all state into the GUI.
+     * Shows an error dialog if the file is missing required fields or is malformed.
+     */
+    private void loadFromFile(File file) {
+        try {
+            List<String> lines = Files.readAllLines(file.toPath());
+
+            int tasksLogged = -1;
+            int ahtVal      = 0;
+            boolean ahtSec  = false;
+            boolean ahtFound = false;
+            List<long[]> loadedLaps = new ArrayList<>();
+
+            boolean inTable      = false;
+            boolean pastSeparator = false;
+
+            for (String raw : lines) {
+                String line = raw.trim();
+
+                // --- Header fields ---
+                if (line.startsWith("Tasks Logged") && line.contains(":")) {
+                    String val = line.substring(line.indexOf(':') + 1).trim();
+                    tasksLogged = Integer.parseInt(val);
+                    continue;
+                }
+
+                if (line.startsWith("AHT Target") && line.contains(":")) {
+                    String ahtStr = line.substring(line.indexOf(':') + 1).trim();
+                    String[] parts = ahtStr.split("\\s+");
+                    if (parts.length >= 1) {
+                        ahtVal  = Integer.parseInt(parts[0]);
+                        ahtSec  = parts.length >= 2 && parts[1].equalsIgnoreCase("sec");
+                        ahtFound = true;
+                    }
+                    continue;
+                }
+
+                // --- Task log section ---
+                if (line.startsWith("--- Task Log ---")) {
+                    inTable = true;
+                    continue;
+                }
+
+                if (inTable && line.startsWith("------")) {
+                    pastSeparator = true;
+                    continue;
+                }
+
+                if (pastSeparator && !line.isEmpty() && !line.startsWith("===")) {
+                    // Data row: "N  HH:MM:SS.cs  HH:MM:SS.cs  HH:MM:SS"
+                    String[] parts = line.split("\\s+");
+                    if (parts.length >= 4) {
+                        long toMs    = parseTimestampMs(parts[2]);   // "To" column (full precision)
+                        long splitMs = parseHMSms(parts[3]);         // "Handle Time" column
+                        loadedLaps.add(new long[]{toMs, splitMs});
+                    }
+                }
+            }
+
+            // --- Validate ---
+            if (tasksLogged < 0 || loadedLaps.isEmpty() || loadedLaps.size() != tasksLogged) {
+                showInvalidFileError(file.getName());
+                return;
+            }
+
+            // --- Stop clock if running ---
+            if (running) {
+                elapsedAtPause += System.currentTimeMillis() - startTime;
+                running = false;
+                swingTimer.stop();
+            }
+
+            // --- Restore laps ---
+            laps.addAll(loadedLaps);
+            lapNumber     = tasksLogged;
+            elapsedAtPause = laps.get(laps.size() - 1)[0];  // total elapsed = last lap's "To"
+            lastLapTime   = elapsedAtPause;
+
+            // --- Restore AHT (silently update field without re-triggering parseAht mid-load) ---
+            if (ahtFound && ahtVal > 0) {
+                ahtValue    = ahtVal;
+                ahtInSeconds = ahtSec;
+                // Temporarily remove the document listener to avoid parse feedback loops
+                ahtField.setText(String.valueOf(ahtVal));
+                ahtUnitBox.setSelectedIndex(ahtSec ? 1 : 0);
+            }
+
+            // --- Repopulate table (rows stored newest-first) ---
+            for (int i = 0; i < laps.size(); i++) {
+                long[] lap     = laps.get(i);
+                String fromStr = (i == 0) ? "00:00:00.00" : formatMs(laps.get(i - 1)[0]);
+                String toStr   = formatMs(lap[0]);
+                String splitStr = formatHMS(lap[1]);
+                tableModel.insertRow(0, new Object[]{i + 1, fromStr, toStr, splitStr});
+            }
+
+            // --- Restore displays ---
+            timeDisplay.setText(formatMs(elapsedAtPause));
+            splitDisplay.setText("00:00:00");
+            splitDisplay.setForeground(Color.decode("#1a8cff"));
+
+            // --- Restore button states (loaded = paused, ready to resume) ---
+            styleButton(playBtn,  "[ Resume ]", "#1a8cff", "#0f0f0f");
+            styleButton(lapBtn,   "[ Log ]",    "#2a2a2a", "#888888");
+            lapBtn.setEnabled(false);
+            resetBtn.setEnabled(true);
+
+            // --- Restore summary + alerts ---
+            updateSummary();
+            pack();
+
+        } catch (Exception ex) {
+            showInvalidFileError(file.getName());
+        }
+    }
+
+    /** Parse full-precision timestamp "HH:MM:SS.cs" → milliseconds. */
+    private long parseTimestampMs(String s) {
+        // Split on both ':' and '.'
+        String[] parts = s.split("[:\\.]");
+        if (parts.length < 4) throw new IllegalArgumentException("Bad timestamp: " + s);
+        long h  = Long.parseLong(parts[0]);
+        long m  = Long.parseLong(parts[1]);
+        long sc = Long.parseLong(parts[2]);
+        long cs = Long.parseLong(parts[3]);
+        return h * 3_600_000L + m * 60_000L + sc * 1_000L + cs * 10L;
+    }
+
+    /** Parse compact timestamp "HH:MM:SS" → milliseconds. */
+    private long parseHMSms(String s) {
+        String[] parts = s.trim().split(":");
+        if (parts.length < 3) throw new IllegalArgumentException("Bad HH:MM:SS: " + s);
+        long h  = Long.parseLong(parts[0]);
+        long m  = Long.parseLong(parts[1]);
+        long sc = Long.parseLong(parts[2]);
+        return h * 3_600_000L + m * 60_000L + sc * 1_000L;
+    }
+
+    private void showInvalidFileError(String filename) {
+        JOptionPane.showMessageDialog(
+                this,
+                "The selected file could not be loaded:\n\"" + filename + "\"\n\n"
+                + "The file does not appear to be a valid TaskWatch session report.\n"
+                + "Please select a file previously saved by TaskWatch.",
+                "Invalid File",
+                JOptionPane.ERROR_MESSAGE
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -410,7 +619,7 @@ public class TaskWatch extends JFrame {
     /**
      * Writes a session report to the "Saved Tasks" folder next to the program.
      *
-     * @param silent  true = no dialogs (auto-save and shutdown hook)
+     * @param silent  true = no dialogs (shutdown hook)
      */
     private void saveReport(boolean silent) {
         if (laps.isEmpty()) {
