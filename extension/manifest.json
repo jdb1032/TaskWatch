@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "TaskWatch",
+  "version": "1.0.0",
+  "description": "A task handle-time tracker with AHT targets, lap logging, and pace monitoring.",
+  "action": {
+    "default_title": "TaskWatch"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": ["storage"],
+  "icons": {
+    "16":  "icons/icon16.png",
+    "48":  "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

@@ -20,7 +20,10 @@ jobs:
           java-version: '25'
 
       - name: Build Windows App
-        run: jpackage --input . --main-jar TaskWatch.jar --main-class TaskWatch --name TaskWatch --type exe --dest dist
+        run: |
+          javac desktop/TaskWatch.java -d desktop
+          jar cfm desktop/TaskWatch.jar desktop/MANIFEST.MF -C desktop TaskWatch.class
+          jpackage --input desktop --main-jar TaskWatch.jar --main-class TaskWatch --name TaskWatch --type exe --dest dist
 
       - name: Upload Windows Artifact
         uses: actions/upload-artifact@v4
@@ -44,8 +47,10 @@ jobs:
 
       - name: Build Mac App
         run: |
+          javac desktop/TaskWatch.java -d desktop
+          jar cfm desktop/TaskWatch.jar desktop/MANIFEST.MF -C desktop .
           jpackage \
-            --input . \
+            --input desktop \
             --main-jar TaskWatch.jar \
             --main-class TaskWatch \
             --name TaskWatch \
