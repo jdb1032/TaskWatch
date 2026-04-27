@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TaskWatch</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="app.css" />
+</head>
+<body>
+
+  <div id="root">
+
+    <!-- Header -->
+    <header id="header">
+      <span id="app-title">TASK<span class="accent">WATCH</span></span>
+      <div id="header-actions">
+        <button id="menu-btn" title="Menu">⋯</button>
+      </div>
+    </header>
+
+    <!-- Dropdown Menu -->
+    <div id="dropdown-menu" class="hidden">
+      <label class="menu-item toggle-item">
+        <span>Soft Alerts When On Pace</span>
+        <div class="toggle-wrap">
+          <input type="checkbox" id="pref-soft-alerts" />
+          <span class="toggle-slider"></span>
+        </div>
+      </label>
+      <div class="menu-divider"></div>
+      <button class="menu-item menu-action" id="menu-new">New Session</button>
+    </div>
+
+    <!-- Main clock -->
+    <section id="clock-section">
+      <div id="time-display">00:00:00.00</div>
+
+      <div id="divider"></div>
+
+      <div id="interval-label">HANDLE TIME</div>
+      <div id="split-display">00:00:00</div>
+
+      <!-- AHT row -->
+      <div id="aht-row">
+        <label id="aht-label">AHT:</label>
+        <input id="aht-field" type="text" inputmode="numeric" placeholder="—" maxlength="5" autocomplete="off" />
+        <select id="aht-unit">
+          <option value="min">min</option>
+          <option value="sec">sec</option>
+        </select>
+      </div>
+
+      <!-- Alert banner -->
+      <div id="alert-banner" class="hidden">! TASK OVER AHT !</div>
+    </section>
+
+    <!-- Buttons -->
+    <div id="btn-row">
+      <button id="play-btn" class="btn btn-primary">[ Play ]</button>
+      <button id="lap-btn"  class="btn btn-muted" disabled>[ Log ]</button>
+      <button id="reset-btn" class="btn btn-muted" disabled>[ Reset ]</button>
+    </div>
+
+    <!-- Table -->
+    <div id="table-wrap">
+      <table id="lap-table">
+        <thead>
+          <tr>
+            <th class="col-num">#</th>
+            <th class="col-from">From</th>
+            <th class="col-to">To</th>
+            <th class="col-ht">Handle Time</th>
+          </tr>
+        </thead>
+        <tbody id="lap-tbody">
+          <!-- rows injected by JS -->
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Summary strip -->
+    <div id="summary-strip">
+      <div class="summary-tile" id="tile-total">Total &nbsp; —</div>
+      <div class="summary-tile" id="tile-avg">Avg &nbsp; —</div>
+      <div class="summary-tile" id="tile-pace">Pace &nbsp; —</div>
+    </div>
+
+  </div><!-- /#root -->
+
+  <script src="app.js"></script>
+</body>
+</html>

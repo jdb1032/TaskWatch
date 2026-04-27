@@ -1,0 +1,1032 @@
+import javax.swing.*;
+import javax.swing.table.*;
+import java.awt.*;
+import java.awt.event.*;
+import java.io.*;
+import java.nio.file.*;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+
+public class TaskWatch extends JFrame {
+
+    // --- State ---
+    private long startTime = 0;
+    private long elapsedAtPause = 0;
+    private long lastLapTime = 0;
+    private boolean running = false;
+    private int lapNumber = 0;
+    private final ArrayList<long[]> laps = new ArrayList<>(); // [totalMs, splitMs]
+
+    // AHT state
+    private int ahtValue = 0;           // raw number user typed
+    private boolean ahtInSeconds = false; // false = minutes, true = seconds
+    private boolean intervalBreached = false;
+    private boolean avgBreached = false;
+
+    // Preference: suppress banner when running average is still under AHT
+    private boolean softAlertsWhenOnPace = false;
+
+    // Save state
+    private boolean autoSaveEnabled = true;  // Preferences toggle, on by default
+    private boolean sessionSaved = false;    // prevents shutdown-hook double-save
+
+    // --- UI ---
+    private JLabel timeDisplay;
+    private JLabel splitDisplay;
+    private JLabel ahtAlertBanner;
+    private JTextField ahtField;
+    private JComboBox<String> ahtUnitBox;
+    private JButton playBtn, lapBtn, resetBtn;
+    private DefaultTableModel tableModel;
+    private JLabel totalLabel, avgLabel, paceLabel;
+    private Timer swingTimer;
+
+    // -------------------------------------------------------------------------
+    // Entry point
+    // -------------------------------------------------------------------------
+    public static void main(String[] args) {
+        SwingUtilities.invokeLater(() -> new TaskWatch().setVisible(true));
+    }
+
+    // -------------------------------------------------------------------------
+    // Constructor
+    // -------------------------------------------------------------------------
+    public TaskWatch() {
+        setTitle("Task Watch");
+        // DISPOSE_ON_CLOSE so closing one window doesn't kill sibling windows.
+        // The WindowAdapter below handles the save-on-close prompt and exits
+        // the JVM only when the last window closes.
+        setDefaultCloseOperation(DO_NOTHING_ON_CLOSE);
+        addWindowListener(new WindowAdapter() {
+            @Override public void windowClosing(WindowEvent e) { handleClose(); }
+        });
+
+        // Shutdown hook — catches crashes / force-closes when auto-save is on
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            if (autoSaveEnabled && !laps.isEmpty() && !sessionSaved) {
+                saveReport(true); // silent, off-EDT — file I/O only
+            }
+        }));
+
+        setResizable(false);
+        setBackground(Color.decode("#0f0f0f"));
+
+        // ---- Menu bar ----
+        setJMenuBar(buildMenuBar());
+
+        JPanel root = new JPanel(new BorderLayout(0, 0));
+        root.setBackground(Color.decode("#0f0f0f"));
+        root.setBorder(BorderFactory.createEmptyBorder(28, 28, 28, 28));
+
+        // ---- Clock panel ----
+        JPanel clockPanel = new JPanel();
+        clockPanel.setLayout(new BoxLayout(clockPanel, BoxLayout.Y_AXIS));
+        clockPanel.setBackground(Color.decode("#0f0f0f"));
+        clockPanel.setBorder(BorderFactory.createEmptyBorder(0, 0, 20, 0));
+
+        timeDisplay = new JLabel("00:00:00.00", SwingConstants.CENTER);
+        timeDisplay.setFont(loadMono(64f));
+        timeDisplay.setForeground(Color.decode("#e8e8e8"));
+        timeDisplay.setAlignmentX(Component.CENTER_ALIGNMENT);
+
+        JSeparator sep = new JSeparator(SwingConstants.HORIZONTAL);
+        sep.setForeground(Color.decode("#2a2a2a"));
+        sep.setBackground(Color.decode("#0f0f0f"));
+        sep.setMaximumSize(new Dimension(Integer.MAX_VALUE, 1));
+
+        JLabel intervalTag = new JLabel("HANDLE TIME", SwingConstants.CENTER);
+        intervalTag.setFont(loadMono(10f));
+        intervalTag.setForeground(Color.decode("#969696"));
+        intervalTag.setAlignmentX(Component.CENTER_ALIGNMENT);
+        intervalTag.setBorder(BorderFactory.createEmptyBorder(6, 0, 0, 0));
+
+        splitDisplay = new JLabel("00:00:00", SwingConstants.CENTER);
+        splitDisplay.setFont(loadMono(30f));
+        splitDisplay.setForeground(Color.decode("#1a8cff"));
+        splitDisplay.setAlignmentX(Component.CENTER_ALIGNMENT);
+        splitDisplay.setBorder(BorderFactory.createEmptyBorder(2, 0, 4, 0));
+
+        clockPanel.add(timeDisplay);
+        clockPanel.add(sep);
+        clockPanel.add(intervalTag);
+        clockPanel.add(splitDisplay);
+
+        // ---- AHT input row ----
+        JPanel ahtRow = new JPanel(new FlowLayout(FlowLayout.CENTER, 8, 0));
+        ahtRow.setBackground(Color.decode("#0f0f0f"));
+        ahtRow.setBorder(BorderFactory.createEmptyBorder(10, 0, 0, 0));
+
+        JLabel ahtLabel = new JLabel("AHT:");
+        ahtLabel.setFont(loadMono(12f));
+        ahtLabel.setForeground(Color.decode("#969696"));
+
+        ahtField = new JTextField(4);
+        ahtField.setFont(loadMono(14f));
+        ahtField.setBackground(Color.decode("#1a1a1a"));
+        ahtField.setForeground(Color.decode("#e8e8e8"));
+        ahtField.setCaretColor(Color.decode("#e8e8e8"));
+        ahtField.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(Color.decode("#333333"), 1),
+                BorderFactory.createEmptyBorder(4, 8, 4, 8)));
+        ahtField.setHorizontalAlignment(SwingConstants.CENTER);
+        ahtField.setToolTipText("Enter a whole number");
+        ahtField.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
+            public void insertUpdate(javax.swing.event.DocumentEvent e)  { parseAht(); }
+            public void removeUpdate(javax.swing.event.DocumentEvent e)  { parseAht(); }
+            public void changedUpdate(javax.swing.event.DocumentEvent e) { parseAht(); }
+        });
+
+        // Unit dropdown: min / sec
+        ahtUnitBox = new JComboBox<>(new String[]{"min", "sec"});
+        ahtUnitBox.setFont(loadMono(12f));
+        ahtUnitBox.setBackground(Color.decode("#1a1a1a"));
+        ahtUnitBox.setForeground(Color.decode("#e8e8e8"));
+        ahtUnitBox.setFocusable(false);
+        ahtUnitBox.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        ahtUnitBox.addActionListener(e -> {
+            ahtInSeconds = ahtUnitBox.getSelectedIndex() == 1;
+            parseAht();
+        });
+
+        ahtRow.add(ahtLabel);
+        ahtRow.add(ahtField);
+        ahtRow.add(ahtUnitBox);
+        clockPanel.add(ahtRow);
+
+        // ---- Interval AHT alert banner ----
+        ahtAlertBanner = new JLabel("! TASK OVER AHT !", SwingConstants.CENTER);
+        ahtAlertBanner.setFont(loadMono(14f).deriveFont(Font.BOLD));
+        ahtAlertBanner.setForeground(Color.decode("#ff2222"));
+        ahtAlertBanner.setBackground(Color.decode("#2a0000"));
+        ahtAlertBanner.setOpaque(true);
+        ahtAlertBanner.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(Color.decode("#cc0000"), 2),
+                BorderFactory.createEmptyBorder(6, 0, 6, 0)));
+        ahtAlertBanner.setAlignmentX(Component.CENTER_ALIGNMENT);
+        ahtAlertBanner.setMaximumSize(new Dimension(Integer.MAX_VALUE, 40));
+        ahtAlertBanner.setVisible(false);
+        clockPanel.add(Box.createRigidArea(new Dimension(0, 8)));
+        clockPanel.add(ahtAlertBanner);
+
+        root.add(clockPanel, BorderLayout.NORTH);
+
+        // ---- Buttons ----
+        JPanel btnPanel = new JPanel(new GridLayout(1, 3, 12, 0));
+        btnPanel.setBackground(Color.decode("#0f0f0f"));
+        btnPanel.setBorder(BorderFactory.createEmptyBorder(0, 0, 24, 0));
+
+        playBtn  = makeButton("[ Play ]",  "#1a8cff", "#0f0f0f");
+        lapBtn   = makeButton("[ Log ]",   "#2a2a2a", "#888888");
+        resetBtn = makeButton("[ Reset ]", "#2a2a2a", "#888888");
+
+        lapBtn.setEnabled(false);
+        resetBtn.setEnabled(false);
+
+        playBtn.addActionListener(e -> onPlayPause());
+        lapBtn.addActionListener(e -> onLap());
+        resetBtn.addActionListener(e -> onReset());
+
+        btnPanel.add(playBtn);
+        btnPanel.add(lapBtn);
+        btnPanel.add(resetBtn);
+        root.add(btnPanel, BorderLayout.CENTER);
+
+        // ---- Table ----
+        String[] cols = {"#", "From", "To", "Handle Time"};
+        tableModel = new DefaultTableModel(cols, 0) {
+            public boolean isCellEditable(int r, int c) { return false; }
+        };
+
+        JTable table = new JTable(tableModel);
+        table.setFont(loadMono(13f));
+        table.setBackground(Color.decode("#131313"));
+        table.setForeground(Color.decode("#cccccc"));
+        table.setSelectionBackground(Color.decode("#1a1a2e"));
+        table.setSelectionForeground(Color.decode("#e8e8e8"));
+        table.setRowHeight(28);
+        table.setShowGrid(false);
+        table.setIntercellSpacing(new Dimension(0, 1));
+        table.getTableHeader().setFont(loadMono(12f));
+        table.getTableHeader().setBackground(Color.decode("#1a1a1a"));
+        table.getTableHeader().setForeground(Color.decode("#666666"));
+        table.getTableHeader().setBorder(BorderFactory.createMatteBorder(0, 0, 1, 0, Color.decode("#2a2a2a")));
+
+        int[] widths = {36, 110, 110, 100};
+        for (int i = 0; i < widths.length; i++) {
+            table.getColumnModel().getColumn(i).setPreferredWidth(widths[i]);
+        }
+
+        table.setDefaultRenderer(Object.class, new DefaultTableCellRenderer() {
+            @Override
+            public Component getTableCellRendererComponent(
+                    JTable t, Object val, boolean sel, boolean focus, int row, int col) {
+                super.getTableCellRendererComponent(t, val, sel, focus, row, col);
+                setFont(loadMono(13f));
+                if (sel) {
+                    setBackground(Color.decode("#1e1e3a"));
+                    setForeground(Color.decode("#e8e8e8"));
+                } else {
+                    setBackground(row % 2 == 0 ? Color.decode("#131313") : Color.decode("#161616"));
+                    setForeground(col == 3 ? Color.decode("#1a8cff") : Color.decode("#cccccc"));
+                }
+                setBorder(BorderFactory.createEmptyBorder(0, 8, 0, 8));
+                if (col == 0) setHorizontalAlignment(CENTER);
+                else setHorizontalAlignment(col == 3 ? CENTER : LEFT);
+                return this;
+            }
+        });
+
+        JScrollPane scroll = new JScrollPane(table);
+        scroll.setPreferredSize(new Dimension(400, 280));
+        scroll.setBorder(BorderFactory.createLineBorder(Color.decode("#2a2a2a"), 1));
+        scroll.getViewport().setBackground(Color.decode("#131313"));
+        scroll.setBackground(Color.decode("#131313"));
+
+        // ---- Summary strip ----
+        JPanel sumPanel = new JPanel(new GridLayout(1, 3, 16, 0));
+        sumPanel.setBackground(Color.decode("#0f0f0f"));
+        sumPanel.setBorder(BorderFactory.createEmptyBorder(14, 0, 0, 0));
+        totalLabel = summaryLabel("Total   —");
+        avgLabel   = summaryLabel("Avg   —");
+        paceLabel  = summaryLabel("Pace   —");
+        sumPanel.add(totalLabel);
+        sumPanel.add(avgLabel);
+        sumPanel.add(paceLabel);
+
+        JPanel bottomPanel = new JPanel(new BorderLayout(0, 0));
+        bottomPanel.setBackground(Color.decode("#0f0f0f"));
+        bottomPanel.add(scroll, BorderLayout.CENTER);
+        bottomPanel.add(sumPanel, BorderLayout.SOUTH);
+        root.add(bottomPanel, BorderLayout.SOUTH);
+
+        setContentPane(root);
+        pack();
+        setLocationRelativeTo(null);
+
+        // Register Ctrl+S globally
+        getRootPane().getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW)
+                .put(KeyStroke.getKeyStroke(KeyEvent.VK_S, InputEvent.CTRL_DOWN_MASK), "saveSession");
+        getRootPane().getActionMap().put("saveSession", new AbstractAction() {
+            public void actionPerformed(ActionEvent e) { saveReport(false); }
+        });
+
+        swingTimer = new Timer(10, e -> updateDisplay());
+    }
+
+    // -------------------------------------------------------------------------
+    // Menu bar
+    // -------------------------------------------------------------------------
+    private JMenuBar buildMenuBar() {
+        JMenuBar bar = new JMenuBar();
+        bar.setBackground(Color.decode("#161616"));
+        bar.setBorder(BorderFactory.createMatteBorder(0, 0, 1, 0, Color.decode("#2a2a2a")));
+
+        // ---- File ----
+        JMenu fileMenu = styledMenu("File");
+
+        JMenuItem newItem = styledMenuItem("New");
+        newItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_N, InputEvent.CTRL_DOWN_MASK));
+        newItem.addActionListener(e ->
+            SwingUtilities.invokeLater(() -> new TaskWatch().setVisible(true))
+        );
+
+        JMenuItem loadItem = styledMenuItem("Load Saved Task");
+        loadItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_O, InputEvent.CTRL_DOWN_MASK));
+        loadItem.addActionListener(e -> onLoadSavedTask());
+
+        JMenuItem saveItem = styledMenuItem("Save Session");
+        saveItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_S, InputEvent.CTRL_DOWN_MASK));
+        saveItem.addActionListener(e -> saveReport(false));
+
+        JMenuItem exitItem = styledMenuItem("Exit");
+        exitItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_W, InputEvent.CTRL_DOWN_MASK));
+        exitItem.addActionListener(e -> handleClose());
+
+        fileMenu.add(newItem);
+        fileMenu.add(loadItem);
+        fileMenu.addSeparator();
+        fileMenu.add(saveItem);
+        fileMenu.addSeparator();
+        fileMenu.add(exitItem);
+
+        // ---- Preferences ----
+        JMenu prefMenu = styledMenu("Preferences");
+
+        JCheckBoxMenuItem softAlertsItem = new JCheckBoxMenuItem("Soft Alerts When On Pace");
+        softAlertsItem.setFont(loadMono(13f));
+        softAlertsItem.setBackground(Color.decode("#1e1e1e"));
+        softAlertsItem.setForeground(Color.decode("#cccccc"));
+        softAlertsItem.setToolTipText(
+            "When your running average is still under AHT, suppress the banner "
+            + "and use a muted colour instead of the full red alert.");
+        softAlertsItem.addActionListener(e -> {
+            softAlertsWhenOnPace = softAlertsItem.isSelected();
+            long intervalMs = elapsed() - lastLapTime;
+            if (intervalBreached) refreshIntervalVisuals(intervalMs);
+        });
+
+        JCheckBoxMenuItem autoSaveItem = new JCheckBoxMenuItem("Auto-save backup on close", true);
+        autoSaveItem.setFont(loadMono(13f));
+        autoSaveItem.setBackground(Color.decode("#1e1e1e"));
+        autoSaveItem.setForeground(Color.decode("#cccccc"));
+        autoSaveItem.setToolTipText(
+            "Automatically triggers a save prompt on close. "
+            + "Files go to the 'Saved Tasks' folder next to the program.");
+        autoSaveItem.addActionListener(e -> autoSaveEnabled = autoSaveItem.isSelected());
+
+        prefMenu.add(softAlertsItem);
+        prefMenu.addSeparator();
+        prefMenu.add(autoSaveItem);
+
+        bar.add(fileMenu);
+        bar.add(prefMenu);
+        return bar;
+    }
+
+    private JMenu styledMenu(String text) {
+        JMenu m = new JMenu(text);
+        m.setFont(loadMono(13f));
+        m.setForeground(Color.decode("#cccccc"));
+        m.setBackground(Color.decode("#1e1e1e"));
+        return m;
+    }
+
+    private JMenuItem styledMenuItem(String text) {
+        JMenuItem i = new JMenuItem(text);
+        i.setFont(loadMono(13f));
+        i.setBackground(Color.decode("#1e1e1e"));
+        i.setForeground(Color.decode("#cccccc"));
+        return i;
+    }
+
+    // -------------------------------------------------------------------------
+    // Load Saved Task
+    // -------------------------------------------------------------------------
+
+    /**
+     * Entry point for loading a saved task. If the current session has data,
+     * asks the user whether to open a new window, reset this one, or cancel.
+     */
+    private void onLoadSavedTask() {
+        if (!laps.isEmpty() || elapsedAtPause > 0) {
+            Object[] options = {"Open in New Window", "Reset & Load Here", "Cancel"};
+            int choice = JOptionPane.showOptionDialog(
+                    this,
+                    "The current session has data.\nHow would you like to load the saved task?",
+                    "Load Saved Task",
+                    JOptionPane.YES_NO_CANCEL_OPTION,
+                    JOptionPane.WARNING_MESSAGE,
+                    null,
+                    options,
+                    options[0]
+            );
+
+            if (choice == 0) {
+                // Open a new instance and trigger the file dialog there
+                SwingUtilities.invokeLater(() -> {
+                    TaskWatch tw = new TaskWatch();
+                    tw.setVisible(true);
+                    tw.openLoadDialog();
+                });
+                return;
+            } else if (choice == 1) {
+                // Reset this instance first, then load
+                onReset();
+            } else {
+                // Cancel (choice == 2 or dialog dismissed)
+                return;
+            }
+        }
+        openLoadDialog();
+    }
+
+    /**
+     * Opens a file chooser pointed at the "Saved Tasks" folder (if it exists)
+     * and hands the chosen file off to loadFromFile().
+     */
+    private void openLoadDialog() {
+        JFileChooser fc = new JFileChooser();
+        fc.setDialogTitle("Load Saved Task");
+        fc.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter(
+                "TaskWatch Session Files (*.txt)", "txt"));
+
+        // Default to the Saved Tasks folder if it exists
+        Path savedTasksDir = Paths.get(System.getProperty("user.dir"), "Saved Tasks");
+        if (Files.exists(savedTasksDir)) {
+            fc.setCurrentDirectory(savedTasksDir.toFile());
+        }
+
+        if (fc.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) return;
+        loadFromFile(fc.getSelectedFile());
+    }
+
+    /**
+     * Parses a TaskWatch session report file and restores all state into the GUI.
+     * Shows an error dialog if the file is missing required fields or is malformed.
+     */
+    private void loadFromFile(File file) {
+        try {
+            List<String> lines = Files.readAllLines(file.toPath());
+
+            int tasksLogged = -1;
+            int ahtVal      = 0;
+            boolean ahtSec  = false;
+            boolean ahtFound = false;
+            List<long[]> loadedLaps = new ArrayList<>();
+
+            boolean inTable      = false;
+            boolean pastSeparator = false;
+
+            for (String raw : lines) {
+                String line = raw.trim();
+
+                // --- Header fields ---
+                if (line.startsWith("Tasks Logged") && line.contains(":")) {
+                    String val = line.substring(line.indexOf(':') + 1).trim();
+                    tasksLogged = Integer.parseInt(val);
+                    continue;
+                }
+
+                if (line.startsWith("AHT Target") && line.contains(":")) {
+                    String ahtStr = line.substring(line.indexOf(':') + 1).trim();
+                    String[] parts = ahtStr.split("\\s+");
+                    if (parts.length >= 1) {
+                        ahtVal  = Integer.parseInt(parts[0]);
+                        ahtSec  = parts.length >= 2 && parts[1].equalsIgnoreCase("sec");
+                        ahtFound = true;
+                    }
+                    continue;
+                }
+
+                // --- Task log section ---
+                if (line.startsWith("--- Task Log ---")) {
+                    inTable = true;
+                    continue;
+                }
+
+                if (inTable && line.startsWith("------")) {
+                    pastSeparator = true;
+                    continue;
+                }
+
+                if (pastSeparator && !line.isEmpty() && !line.startsWith("===")) {
+                    // Data row: "N  HH:MM:SS.cs  HH:MM:SS.cs  HH:MM:SS"
+                    String[] parts = line.split("\\s+");
+                    if (parts.length >= 4) {
+                        long toMs    = parseTimestampMs(parts[2]);   // "To" column (full precision)
+                        long splitMs = parseHMSms(parts[3]);         // "Handle Time" column
+                        loadedLaps.add(new long[]{toMs, splitMs});
+                    }
+                }
+            }
+
+            // --- Validate ---
+            if (tasksLogged < 0 || loadedLaps.isEmpty() || loadedLaps.size() != tasksLogged) {
+                showInvalidFileError(file.getName());
+                return;
+            }
+
+            // --- Stop clock if running ---
+            if (running) {
+                elapsedAtPause += System.currentTimeMillis() - startTime;
+                running = false;
+                swingTimer.stop();
+            }
+
+            // --- Restore laps ---
+            laps.addAll(loadedLaps);
+            lapNumber     = tasksLogged;
+            elapsedAtPause = laps.get(laps.size() - 1)[0];  // total elapsed = last lap's "To"
+            lastLapTime   = elapsedAtPause;
+
+            // --- Restore AHT (silently update field without re-triggering parseAht mid-load) ---
+            if (ahtFound && ahtVal > 0) {
+                ahtValue    = ahtVal;
+                ahtInSeconds = ahtSec;
+                // Temporarily remove the document listener to avoid parse feedback loops
+                ahtField.setText(String.valueOf(ahtVal));
+                ahtUnitBox.setSelectedIndex(ahtSec ? 1 : 0);
+            }
+
+            // --- Repopulate table (rows stored newest-first) ---
+            for (int i = 0; i < laps.size(); i++) {
+                long[] lap     = laps.get(i);
+                String fromStr = (i == 0) ? "00:00:00.00" : formatMs(laps.get(i - 1)[0]);
+                String toStr   = formatMs(lap[0]);
+                String splitStr = formatHMS(lap[1]);
+                tableModel.insertRow(0, new Object[]{i + 1, fromStr, toStr, splitStr});
+            }
+
+            // --- Restore displays ---
+            timeDisplay.setText(formatMs(elapsedAtPause));
+            splitDisplay.setText("00:00:00");
+            splitDisplay.setForeground(Color.decode("#1a8cff"));
+
+            // --- Restore button states (loaded = paused, ready to resume) ---
+            styleButton(playBtn,  "[ Resume ]", "#1a8cff", "#0f0f0f");
+            styleButton(lapBtn,   "[ Log ]",    "#2a2a2a", "#888888");
+            lapBtn.setEnabled(false);
+            resetBtn.setEnabled(true);
+
+            // --- Restore summary + alerts ---
+            updateSummary();
+            pack();
+
+        } catch (Exception ex) {
+            showInvalidFileError(file.getName());
+        }
+    }
+
+    /** Parse full-precision timestamp "HH:MM:SS.cs" → milliseconds. */
+    private long parseTimestampMs(String s) {
+        // Split on both ':' and '.'
+        String[] parts = s.split("[:\\.]");
+        if (parts.length < 4) throw new IllegalArgumentException("Bad timestamp: " + s);
+        long h  = Long.parseLong(parts[0]);
+        long m  = Long.parseLong(parts[1]);
+        long sc = Long.parseLong(parts[2]);
+        long cs = Long.parseLong(parts[3]);
+        return h * 3_600_000L + m * 60_000L + sc * 1_000L + cs * 10L;
+    }
+
+    /** Parse compact timestamp "HH:MM:SS" → milliseconds. */
+    private long parseHMSms(String s) {
+        String[] parts = s.trim().split(":");
+        if (parts.length < 3) throw new IllegalArgumentException("Bad HH:MM:SS: " + s);
+        long h  = Long.parseLong(parts[0]);
+        long m  = Long.parseLong(parts[1]);
+        long sc = Long.parseLong(parts[2]);
+        return h * 3_600_000L + m * 60_000L + sc * 1_000L;
+    }
+
+    private void showInvalidFileError(String filename) {
+        JOptionPane.showMessageDialog(
+                this,
+                "The selected file could not be loaded:\n\"" + filename + "\"\n\n"
+                + "The file does not appear to be a valid TaskWatch session report.\n"
+                + "Please select a file previously saved by TaskWatch.",
+                "Invalid File",
+                JOptionPane.ERROR_MESSAGE
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Close handling
+    // -------------------------------------------------------------------------
+    private void handleClose() {
+        if (laps.isEmpty()) {
+            doClose();
+            return;
+        }
+
+        Object[] options = {"Save & Exit", "Exit Without Saving", "Cancel"};
+        int choice = JOptionPane.showOptionDialog(
+                this,
+                "You have " + lapNumber + " logged task(s).\nWould you like to save a session report before closing?",
+                "Save Session",
+                JOptionPane.YES_NO_CANCEL_OPTION,
+                JOptionPane.QUESTION_MESSAGE,
+                null,
+                options,
+                options[0]
+        );
+
+        if (choice == 0) {        // Save & Exit
+            saveReport(false);
+            sessionSaved = true;
+            doClose();
+        } else if (choice == 1) { // Exit Without Saving
+            sessionSaved = true;  // suppress shutdown hook too
+            doClose();
+        }
+        // choice == 2 or dialog dismissed → Cancel: stay open
+    }
+
+    /** Disposes this window; exits the JVM when the last TaskWatch window closes. */
+    private void doClose() {
+        dispose();
+        for (Window w : Window.getWindows()) {
+            if (w instanceof TaskWatch && w.isDisplayable()) return;
+        }
+        System.exit(0);
+    }
+
+    // -------------------------------------------------------------------------
+    // Save logic
+    // -------------------------------------------------------------------------
+    /**
+     * Writes a session report to the "Saved Tasks" folder next to the program.
+     *
+     * @param silent  true = no dialogs (shutdown hook)
+     */
+    private void saveReport(boolean silent) {
+        if (laps.isEmpty()) {
+            if (!silent) JOptionPane.showMessageDialog(this,
+                    "No tasks have been logged yet.", "Nothing to Save",
+                    JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+
+        // ---- Compute summary values ----
+        long total = 0;
+        for (long[] lap : laps) total += lap[1];
+        long avg = total / laps.size();
+
+        // Pace: mirror the same formula used by updatePace() / formatPace()
+        String paceStr = "—";
+        long limit = ahtLimitMs();
+        if (limit > 0) {
+            long target   = (long) laps.size() * limit;
+            long paceMs   = target - elapsed();
+            boolean ahead = paceMs >= 0;
+            paceStr = (ahead ? "+" : "-") + formatPace(Math.abs(paceMs));
+        }
+
+        String timestamp   = new SimpleDateFormat("yyyy-MM-dd_HH-mm-ss").format(new Date());
+        String displayTime = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date());
+        String filename    = "TaskWatch_" + timestamp + ".txt";
+
+        // ---- Resolve save directory: <working dir>/Saved Tasks/ ----
+        Path saveDir = Paths.get(System.getProperty("user.dir"), "Saved Tasks");
+        try {
+            Files.createDirectories(saveDir);
+            Path outFile = saveDir.resolve(filename);
+
+            // ---- Build report ----
+            StringBuilder sb = new StringBuilder();
+            sb.append("========================================\n");
+            sb.append("        TaskWatch — Session Report      \n");
+            sb.append("========================================\n");
+            sb.append("Saved         : ").append(displayTime).append("\n");
+            sb.append("\n");
+            sb.append("Tasks Logged  : ").append(lapNumber).append("\n");
+            sb.append("Total Time    : ").append(formatHMS(total)).append("\n");
+            sb.append("Average AHT   : ").append(formatHMS(avg)).append("\n");
+            sb.append("Pace          : ").append(paceStr).append("\n");
+            if (ahtValue > 0) {
+                sb.append("AHT Target    : ").append(ahtValue)
+                  .append(ahtInSeconds ? " sec" : " min").append("\n");
+            }
+            sb.append("\n");
+            sb.append("--- Task Log ---\n");
+            sb.append(String.format("%-6s  %-13s  %-13s  %-13s%n",
+                    "#", "From", "To", "Handle Time"));
+            sb.append("------  -------------  -------------  -------------\n");
+
+            for (int i = 0; i < laps.size(); i++) {
+                long[] lap   = laps.get(i);
+                String from  = (i == 0) ? "00:00:00.00" : formatMs(laps.get(i - 1)[0]);
+                String to    = formatMs(lap[0]);
+                String split = formatHMS(lap[1]);
+                sb.append(String.format("%-6d  %-13s  %-13s  %-13s%n", i + 1, from, to, split));
+            }
+
+            sb.append("========================================\n");
+
+            Files.writeString(outFile, sb.toString());
+
+            if (!silent) {
+                JOptionPane.showMessageDialog(this,
+                        "Session saved to:\n" + outFile.toAbsolutePath(),
+                        "Saved", JOptionPane.INFORMATION_MESSAGE);
+            }
+
+        } catch (IOException ex) {
+            if (!silent) {
+                JOptionPane.showMessageDialog(this,
+                        "Could not save session:\n" + ex.getMessage(),
+                        "Save Error", JOptionPane.ERROR_MESSAGE);
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Actions
+    // -------------------------------------------------------------------------
+    private void onPlayPause() {
+        if (!running) {
+            startTime = System.currentTimeMillis();
+            if (elapsedAtPause == 0) lastLapTime = 0;
+            running = true;
+            swingTimer.start();
+            styleButton(playBtn, "[ Pause ]", "#ff6b35", "#0f0f0f");
+            lapBtn.setEnabled(true);
+            resetBtn.setEnabled(false);
+        } else {
+            elapsedAtPause += System.currentTimeMillis() - startTime;
+            running = false;
+            swingTimer.stop();
+            styleButton(playBtn, "[ Resume ]", "#1a8cff", "#0f0f0f");
+            lapBtn.setEnabled(false);
+            resetBtn.setEnabled(true);
+        }
+    }
+
+    private void onLap() {
+        long now = elapsed();
+        long splitMs = laps.isEmpty() ? now : now - lastLapTime;
+        lastLapTime = now;
+        lapNumber++;
+        laps.add(new long[]{now, splitMs});
+
+        // From/To use full centisecond precision; Handle Time column uses HH:MM:SS
+        String fromStr  = lapNumber == 1 ? "00:00:00.00" : formatMs(laps.get(lapNumber - 2)[0]);
+        String toStr    = formatMs(now);
+        String splitStr = formatHMS(splitMs);
+        tableModel.insertRow(0, new Object[]{lapNumber, fromStr, toStr, splitStr});
+
+        clearIntervalAlert();
+        updateSummary();
+    }
+
+    private void onReset() {
+        elapsedAtPause = 0;
+        lastLapTime = 0;
+        lapNumber = 0;
+        laps.clear();
+        tableModel.setRowCount(0);
+        timeDisplay.setText("00:00:00.00");
+        splitDisplay.setText("00:00:00");
+        totalLabel.setText("Total   —");
+        avgLabel.setText("Avg   —");
+        resetPaceLabel();
+        clearIntervalAlert();
+        clearAvgAlert();
+        styleButton(playBtn, "[ Play ]", "#1a8cff", "#0f0f0f");
+        styleButton(lapBtn, "[ Log ]", "#2a2a2a", "#888888");
+        lapBtn.setEnabled(false);
+        resetBtn.setEnabled(false);
+    }
+
+    // -------------------------------------------------------------------------
+    // Display & alert logic
+    // -------------------------------------------------------------------------
+    private void updateDisplay() {
+        long now = elapsed();
+        long intervalMs = now - lastLapTime;
+        timeDisplay.setText(formatMs(now));
+        splitDisplay.setText(formatHMS(intervalMs));
+        checkIntervalBreach(intervalMs);
+        updatePace();
+    }
+
+    /** AHT threshold in milliseconds; 0 if not configured. */
+    private long ahtLimitMs() {
+        if (ahtValue <= 0) return 0;
+        return ahtInSeconds
+                ? (long) ahtValue * 1000
+                : (long) ahtValue * 60 * 1000;
+    }
+
+    /**
+     * Returns true when elapsed is still inside the cumulative AHT budget
+     * for the laps completed so far — identical logic to updatePace().
+     */
+    private boolean isOnPace() {
+        long limit = ahtLimitMs();
+        if (limit <= 0) return false;
+        if (laps.isEmpty()) return true;
+        long target = (long) laps.size() * limit;
+        return (target - elapsed()) >= 0;
+    }
+
+    // -------------------------------------------------------------------------
+    // Pace indicator (live — driven by updateDisplay every 10 ms)
+    // -------------------------------------------------------------------------
+    /**
+     * Pace = (completedTasks × ahtLimitMs) − elapsed
+     *
+     * Positive → ahead of budget (green)  e.g. "+8:00"
+     * Negative → behind budget  (red)     e.g. "-5:30"
+     *
+     * Requires AHT to be set and at least one lap logged.
+     */
+    private void updatePace() {
+        long limit = ahtLimitMs();
+        if (limit <= 0 || laps.isEmpty()) {
+            resetPaceLabel();
+            return;
+        }
+
+        long target  = (long) laps.size() * limit;
+        long pace    = target - elapsed();   // + = ahead, - = behind
+        boolean ahead = pace >= 0;
+
+        String sign    = ahead ? "+" : "-";
+        String timeStr = formatPace(Math.abs(pace));
+        paceLabel.setText("Pace  " + sign + timeStr);
+        paceLabel.setOpaque(true);
+
+        if (ahead) {
+            paceLabel.setForeground(Color.decode("#22cc66"));
+            paceLabel.setBackground(Color.decode("#0a1f12"));
+            paceLabel.setBorder(BorderFactory.createCompoundBorder(
+                    BorderFactory.createLineBorder(Color.decode("#1a6635"), 1),
+                    BorderFactory.createEmptyBorder(6, 0, 6, 0)));
+        } else {
+            paceLabel.setForeground(Color.decode("#ff5555"));
+            paceLabel.setBackground(Color.decode("#1f0a0a"));
+            paceLabel.setBorder(BorderFactory.createCompoundBorder(
+                    BorderFactory.createLineBorder(Color.decode("#661a1a"), 1),
+                    BorderFactory.createEmptyBorder(6, 0, 6, 0)));
+        }
+    }
+
+    /** Restore pace tile to neutral/empty state. */
+    private void resetPaceLabel() {
+        paceLabel.setText("Pace   —");
+        paceLabel.setForeground(Color.decode("#555555"));
+        paceLabel.setBackground(Color.decode("#111111"));
+        paceLabel.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(Color.decode("#1e1e1e"), 1),
+                BorderFactory.createEmptyBorder(6, 0, 6, 0)));
+    }
+
+    /**
+     * Format milliseconds as M:SS or H:MM:SS (seconds precision is
+     * appropriate for a budget/pace metric — no centiseconds needed).
+     */
+    private String formatPace(long ms) {
+        long totalSecs = ms / 1000;
+        long s = totalSecs % 60;
+        long m = (totalSecs / 60) % 60;
+        long h = totalSecs / 3600;
+        if (h > 0) return String.format("%d:%02d:%02d", h, m, s);
+        return String.format("%d:%02d", m, s);
+    }
+
+    private void checkIntervalBreach(long intervalMs) {
+        long limit = ahtLimitMs();
+        if (limit <= 0) {
+            if (intervalBreached) clearIntervalAlert();
+            return;
+        }
+        boolean over = intervalMs >= limit;
+        if (over) {
+            boolean wasBreached = intervalBreached;
+            intervalBreached = true;
+            refreshIntervalVisuals(intervalMs);
+            if (!wasBreached) pack(); // resize only on first breach (banner may appear)
+        } else if (intervalBreached) {
+            clearIntervalAlert();
+        }
+    }
+
+    /**
+     * Applies the correct visual state for an active interval breach,
+     * respecting the "Soft Alerts When On Pace" preference.
+     * Call whenever breach is active and something that affects the decision changes
+     * (timer tick, preference toggle, AHT value change).
+     */
+    private void refreshIntervalVisuals(long intervalMs) {
+        boolean quiet = softAlertsWhenOnPace && isOnPace();
+        boolean bannerShouldShow = !quiet;
+
+        if (ahtAlertBanner.isVisible() != bannerShouldShow) {
+            ahtAlertBanner.setVisible(bannerShouldShow);
+            pack();
+        }
+        // Full alarm red vs. muted coral
+        splitDisplay.setForeground(Color.decode(quiet ? "#ff9999" : "#ff2222"));
+    }
+
+    private void checkAvgBreach(long avgMs) {
+        long limit = ahtLimitMs();
+        if (limit <= 0) {
+            if (avgBreached) clearAvgAlert();
+            return;
+        }
+        boolean over = avgMs > limit;
+        if (over && !avgBreached) {
+            avgBreached = true;
+            avgLabel.setBackground(Color.decode("#2a0000"));
+            avgLabel.setForeground(Color.decode("#ff4444"));
+            avgLabel.setBorder(BorderFactory.createCompoundBorder(
+                    BorderFactory.createLineBorder(Color.decode("#cc0000"), 2),
+                    BorderFactory.createEmptyBorder(5, 0, 5, 0)));
+            // Only avg breach turns the main clock red
+            timeDisplay.setForeground(Color.decode("#ff6666"));
+            // Average is now over — if a task breach is active, force full alert
+            if (intervalBreached) refreshIntervalVisuals(elapsed() - lastLapTime);
+        } else if (!over && avgBreached) {
+            clearAvgAlert();
+        }
+    }
+
+    private void clearIntervalAlert() {
+        intervalBreached = false;
+        ahtAlertBanner.setVisible(false);
+        splitDisplay.setForeground(Color.decode("#1a8cff"));
+        // Do NOT touch main clock colour — that belongs to the avg alert
+        pack();
+    }
+
+    private void clearAvgAlert() {
+        avgBreached = false;
+        avgLabel.setBackground(Color.decode("#111111"));
+        avgLabel.setForeground(Color.decode("#555555"));
+        avgLabel.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(Color.decode("#1e1e1e"), 1),
+                BorderFactory.createEmptyBorder(6, 0, 6, 0)));
+        timeDisplay.setForeground(Color.decode("#e8e8e8")); // restore main clock to white
+    }
+
+    private void parseAht() {
+        String txt = ahtField.getText().trim();
+        try {
+            int val = Integer.parseInt(txt);
+            ahtValue = val > 0 ? val : 0;
+        } catch (NumberFormatException ex) {
+            ahtValue = 0;
+        }
+        // Re-evaluate both alerts immediately
+        long intervalMs = elapsed() - lastLapTime;
+        checkIntervalBreach(intervalMs);
+        if (!laps.isEmpty()) {
+            long total = 0;
+            for (long[] lap : laps) total += lap[1];
+            checkAvgBreach(total / laps.size());
+        } else {
+            if (avgBreached) clearAvgAlert();
+        }
+        updatePace();
+    }
+
+    private void updateSummary() {
+        long total = 0;
+        for (long[] lap : laps) total += lap[1];
+        long avg = laps.isEmpty() ? 0 : total / laps.size();
+        totalLabel.setText("Total   " + formatHMS(total));
+        avgLabel.setText("Avg   " + formatHMS(avg));
+        checkAvgBreach(avg);
+        updatePace();
+    }
+
+    private long elapsed() {
+        return running
+                ? elapsedAtPause + (System.currentTimeMillis() - startTime)
+                : elapsedAtPause;
+    }
+
+    /** Full precision: HH:MM:SS.cs — used for the live clocks and From/To columns. */
+    private String formatMs(long ms) {
+        long centis = ms / 10;
+        long cs = centis % 100;
+        long s  = (centis / 100) % 60;
+        long m  = (centis / 6000) % 60;
+        long h  = centis / 360000;
+        return String.format("%02d:%02d:%02d.%02d", h, m, s, cs);
+    }
+
+    /** Compact: HH:MM:SS — used for the Handle Time column and summary totals. */
+    private String formatHMS(long ms) {
+        long totalSec = ms / 1000;
+        long s = totalSec % 60;
+        long m = (totalSec / 60) % 60;
+        long h = totalSec / 3600;
+        return String.format("%02d:%02d:%02d", h, m, s);
+    }
+
+    // -------------------------------------------------------------------------
+    // UI factory helpers
+    // -------------------------------------------------------------------------
+    private JButton makeButton(String text, String bg, String fg) {
+        JButton b = new JButton(text);
+        styleButton(b, text, bg, fg);
+        b.setFocusPainted(false);
+        b.setBorderPainted(false);
+        b.setPreferredSize(new Dimension(120, 44));
+        b.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        return b;
+    }
+
+    private void styleButton(JButton b, String text, String bg, String fg) {
+        b.setText(text);
+        b.setBackground(Color.decode(bg));
+        b.setForeground(Color.decode(fg));
+        b.setFont(loadMono(14f).deriveFont(Font.BOLD));
+        b.setOpaque(true);
+        b.repaint();
+    }
+
+    private JLabel summaryLabel(String text) {
+        JLabel l = new JLabel(text, SwingConstants.CENTER);
+        l.setFont(loadMono(13f));
+        l.setForeground(Color.decode("#555555"));
+        l.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(Color.decode("#1e1e1e"), 1),
+                BorderFactory.createEmptyBorder(6, 0, 6, 0)));
+        l.setBackground(Color.decode("#111111"));
+        l.setOpaque(true);
+        return l;
+    }
+
+    private Font loadMono(float size) {
+        return new Font("JetBrains Mono", Font.PLAIN, (int) size)
+                .getFamily().equals("JetBrains Mono")
+                ? new Font("JetBrains Mono", Font.PLAIN, (int) size)
+                : new Font(Font.MONOSPACED, Font.PLAIN, (int) size);
+    }
+}
